@@ -1,0 +1,24 @@
+{
+  "idf.customExtraVars": {},
+  "idf.flashType": "UART",
+
+  // ── Windows ──────────────────────────────────────────────────────────────
+  "idf.currentSetup": "C:\\Espressif\\frameworks\\v5.5.4\\esp-idf",
+  "clangd.path": "C:\\Espressif\\tools\\esp-clang\\esp-20.1.1_20250829\\esp-clang\\bin\\clangd.exe",
+  "clangd.arguments": [
+    "--background-index",
+    "--query-driver=**",
+    "--compile-commands-dir=${workspaceFolder}/build"
+  ],
+  "idf.port": "COM3"
+
+  // ── Linux (comment out the Windows block above and uncomment below) ───────
+  // "idf.currentSetup": "/home/alucas/esp/esp-idf",
+  // "clangd.path": "/home/alucas/.espressif/tools/esp-clang/esp-19.1.2_20250312/esp-clang/bin/clangd",
+  // "clangd.arguments": [
+  //   "--background-index",
+  //   "--query-driver=**",
+  //   "--compile-commands-dir=${workspaceFolder}/build"
+  // ],
+  // "idf.port": "/dev/ttyUSB0"
+}
