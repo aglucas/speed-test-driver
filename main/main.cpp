@@ -48,6 +48,7 @@ static const char *TAG = "speed_test";
 #define UDC_IDX                2006
 #define POWER_ID               2011    // DC bus power, kW (VCU already computes udc*idc)
 #define OPMODE_ID              2002    // opmode spot value (see OPMODES below)
+#define KWH_ID                 2013    // cumulative energy counter, kWh (VALUE_ENTRY(KWh,"kwh",2013))
 
 // ZombieVerter opmode states (param_prj.h "modes" enum / OPMODES string:
 // "0=Off, 1=Run, 2=Precharge, 3=PchFail, 4=Charge, 5=Preheat"). The DC bus
@@ -58,13 +59,17 @@ static const char *TAG = "speed_test";
 #define DEFAULT_UDC_V          400.0f
 #define DEFAULT_SOC_PCT        15.0f
 
-// IVT / Isabellenhütte shunt broadcast (see Stm32-vcu/src/isa_shunt.cpp). The
-// shunt puts its cumulative energy counter on CAN 0x528 autonomously — no SDO
-// request needed, it's a plain broadcast we're already receiving (ACCEPT_ALL
-// filter). Raw value is a signed int32 in Wh (the VCU divides it by 1000 to get
-// kWh, see utils.cpp). We snoop it off the bus and forward it in the telemetry;
-// the waveform display integrates the deltas into trip/lifetime/charge counters.
-#define IVT_ENERGY_ID          0x528
+// Cumulative energy comes from the ZombieVerter's KWh spot value, NOT from the
+// IVT/Isabellenhütte shunt directly: the shunt's 0x528 broadcast lives on a CAN
+// bus we are not wired to, so it can never be snooped here. The VCU *is* on that
+// bus — it decodes 0x528 (ISA::handle528, isa_shunt.cpp) and republishes the
+// counter as Param::KWh in kWh (utils.cpp: KWh/1000) — so we read the same number
+// back out over SDO instead.
+//
+// Resolution: openinverter SDO values are fixed-point with 5 fractional bits, so
+// a kWh-valued param quantises to 1/32 kWh = 31.25 Wh. Fine for the trip/lifetime
+// counters and the efficiency average (~1/8 mile of driving per step), but it does
+// mean energy_wh advances in steps rather than smoothly.
 
 // =============================================================================
 // ESP-NOW — Qualia receiver MAC
@@ -84,7 +89,7 @@ typedef struct __attribute__((packed)) {
     float temp_isa_c;
     float soc_pct;
     float udc_v;
-    float energy_wh; // IVT 0x528 cumulative energy counter, Wh (signed; polarity per shunt wiring)
+    float energy_wh; // cumulative energy counter, Wh (signed; ZombieVerter KWh spot value x1000)
     uint8_t opmode;  // ZombieVerter opmode: 0=Off 1=Run 2=Precharge 3=PchFail 4=Charge 5=Preheat
     uint8_t ready;   // set to 0xA5 when valid; must stay last
 } TelemetryPacket;
@@ -164,7 +169,7 @@ static portMUX_TYPE         ow_mux      = portMUX_INITIALIZER_UNLOCKED;
 // =============================================================================
 // PWM outputs (LEDC) — analogue-style gauge drives
 //   GPIO 32 → state of charge   (0 % SOC = 0 % duty, 100 % SOC = 100 % duty)
-//   GPIO 33 → battery (BMS) temp (2-segment: -15 °C = 0 %, 27 °C = 50 %, 45 °C = 100 %)
+//   GPIO 33 → battery (BMS) temp (2-segment: -15 °C = 0 %, 30 °C = 50 %, 50 °C = 100 %)
 // Both pins are free on the DOIT DEVKIT V1: not strapping pins, not input-only
 // (34-39), clear of the SPI flash (6-11), the DAC (25/26), CAN (18/19),
 // OneWire (15) and I2C (21/22).
@@ -189,7 +194,7 @@ static portMUX_TYPE         ow_mux      = portMUX_INITIALIZER_UNLOCKED;
 // mid-scale lands on typical ambient and the needle spreads out as it gets hot.
 #define BAT_TEMP_PWM_MIN_C (-15.0f)   // → 0 %
 #define BAT_TEMP_PWM_MID_C ( 30.0f)   // → 50 %
-#define BAT_TEMP_PWM_MAX_C ( 45.0f)   // → 100 %
+#define BAT_TEMP_PWM_MAX_C ( 50.0f)   // → 100 %
 
 // --- Current telemetry values ---
 static float speed_mph  = 0.0f;
@@ -200,7 +205,7 @@ static float temp_isa_c = 0.0f;
 static float soc_pct    = 100.0f;
 static float udc_v      = 0.0f;
 static float power_kw   = 0.0f;   // DC bus power from ZombieVerter (POWER_ID)
-static float energy_wh  = 0.0f;   // IVT 0x528 cumulative energy counter, Wh (snooped off CAN)
+static float energy_wh  = 0.0f;   // cumulative energy counter, Wh (ZombieVerter KWh spot value x1000)
 // volatile: written by the main loop (CPU 0), read by ds18b20_task (CPU 1) to
 // pick its sample period. 32-bit aligned reads/writes are atomic on ESP32.
 static volatile int opmode = 0;   // ZombieVerter opmode (0=Off … see OPMODE_ID)
@@ -237,7 +242,7 @@ static inline float constrain_f(float v, float lo, float hi) {
 //
 // The piecewise fit is monotonic by construction for any MIN < MID < MAX, and
 // each half keeps a constant, legible slope. The cost is a slope discontinuity
-// at MID (1.19 %/C below, 2.78 %/C above) — a slight kink as the needle crosses
+// at MID (1.11 %/C below, 2.50 %/C above) — a slight kink as the needle crosses
 // centre, which is a fair trade for a gauge that can never read backwards.
 //
 // The input is clamped, not the output, so an absurd reading pins to an end
@@ -327,21 +332,6 @@ static void requestSdo(int id) {
     twai_transmit(&msg, pdMS_TO_TICKS(10));
 }
 
-// Snoop the IVT shunt's cumulative-energy broadcast (0x528) off the bus. The
-// only place we drain the TWAI RX queue is getSdoValue()'s receive loop, so we
-// call this on every frame it sees there — matching frames update energy_wh,
-// everything else is ignored. Decode mirrors ISA::handle528 (isa_shunt.cpp):
-// signed int32 from data[2..5], little-endian, 1 Wh/LSB.
-static inline void snoopIvt(const twai_message_t *rx) {
-    if (rx->identifier == IVT_ENERGY_ID && rx->data_length_code >= 6) {
-        int32_t wh = (int32_t)(((uint32_t)rx->data[5] << 24) |
-                               ((uint32_t)rx->data[4] << 16) |
-                               ((uint32_t)rx->data[3] << 8)  |
-                               ((uint32_t)rx->data[2]));
-        energy_wh = (float)wh;
-    }
-}
-
 static float getSdoValue(int id) {
     uint16_t index  = SDO_INDEX_BASE | (uint16_t)(id >> 8);
     uint8_t  subIdx = (uint8_t)(id & 0xFF);
@@ -357,7 +347,6 @@ static float getSdoValue(int id) {
     while (millis() < deadline) {
         twai_message_t rx = {};
         if (twai_receive(&rx, pdMS_TO_TICKS(10)) == ESP_OK) {
-            snoopIvt(&rx);   // capture the IVT 0x528 energy broadcast if this is it
             if (rx.identifier       == SDO_REP_ID
                     && rx.data_length_code == 8
                     && rx.data[0]          != SDO_ABORT
@@ -576,7 +565,7 @@ static void fillPacket(void) {
     packet.udc_v      = (opmode == MOD_RUN || opmode == MOD_CHARGE) ? udc_v : DEFAULT_UDC_V;
     // Raw opmode so the displays can show Run / Charging / Off themselves.
     packet.opmode     = (uint8_t)constrain_f((float)opmode, 0.0f, 255.0f);
-    // IVT cumulative energy counter, forwarded raw (Wh). The display owns the
+    // Cumulative energy counter, forwarded in Wh. The display owns the
     // trip/lifetime/charge bookkeeping by integrating deltas of this value.
     packet.energy_wh  = energy_wh;
     packet.ready      = 0xA5;
@@ -1002,10 +991,10 @@ extern "C" void app_main(void) {
     // --- CAN / TWAI init ---
     twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(
         CAN_TX_PIN, CAN_RX_PIN, TWAI_MODE_NORMAL);
-    // The IVT 0x528 energy broadcast is only drained inside getSdoValue()'s
-    // receive loop, which returns as soon as it finds its SDO reply — so frames
-    // pile up between calls. Deepen the RX queue (default 5) so a burst of shunt
-    // broadcasts isn't dropped before the next SDO read snoops them.
+    // The filter is ACCEPT_ALL and the queue is only drained inside getSdoValue()'s
+    // receive loop, which returns as soon as it finds its SDO reply — so unrelated
+    // bus traffic piles up between calls. Deepen the RX queue (default 5) so a burst
+    // of other frames can't evict an SDO reply before we get to read it.
     g_config.rx_queue_len = 32;
     twai_timing_config_t  t_config = TWAI_TIMING_CONFIG_500KBITS();
     twai_filter_config_t  f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
@@ -1077,10 +1066,10 @@ extern "C" void app_main(void) {
     ESP_LOGI(TAG, "Ready - reading CAN, forwarding via ESP-NOW");
 
     // =============================================================================
-    // Main loop — RPM polled at SEND_INTERVAL_MS (200 ms, 5 Hz).
-    // Slow params (SOC, temps, UDC+opmode) rotate one slot per SLOW_INTERVAL_MS
-    // across 6 slots; the UDC slot reads opmode too, so the ZombieVerter SDO
-    // server sees at most 7 requests/second total.
+    // Main loop — RPM and power polled at SEND_INTERVAL_MS (200 ms, 5 Hz).
+    // Slow params (SOC, temps, UDC+opmode, energy) rotate one slot per
+    // SLOW_INTERVAL_MS across 7 slots; the UDC slot reads opmode too, so the
+    // ZombieVerter SDO server sees at most 12 requests/second total.
     // =============================================================================
     uint8_t fetchIndex = 0;
     while (true) {
@@ -1132,10 +1121,10 @@ extern "C" void app_main(void) {
             lastI2cTime = millis();
         }
 
-        // Slow params — rotating across 6 slots (the UDC slot also reads opmode)
+        // Slow params — rotating across 7 slots (the UDC slot also reads opmode)
         if (now - lastSlowTime >= SLOW_INTERVAL_MS) {
             float v;
-            switch (fetchIndex % 6) {
+            switch (fetchIndex % 7) {
                 case 0:
                     v = getSdoValue(SOC_VALUE_ID);
                     if (!isnan(v)) soc_pct    = constrain_f(v, 0.0f, 100.0f);
@@ -1164,6 +1153,15 @@ extern "C" void app_main(void) {
                     if (!isnan(v)) udc_v      = v;
                     v = getSdoValue(OPMODE_ID);
                     if (!isnan(v)) opmode     = (int)lroundf(v);
+                    break;
+                case 6:
+                    // Cumulative energy, kWh from the VCU -> Wh on the wire. Being a
+                    // running total, a slow poll loses no energy: the display
+                    // integrates deltas, so whatever accrued between reads still
+                    // lands in full on the next one. A dropped read is likewise
+                    // harmless — the next successful one carries the whole gap.
+                    v = getSdoValue(KWH_ID);
+                    if (!isnan(v)) energy_wh  = v * 1000.0f;
                     break;
             }
             fetchIndex++;
