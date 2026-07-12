@@ -1,0 +1,17 @@
+# I2C slave driver v2.
+#
+# Required, not optional: the v1 slave driver has a race that crashes this board.
+# i2c_slave_transmit() pushes bytes into the TX ring buffer BEFORE updating
+# trans_data_length under the spinlock, so if the TX interrupt is already enabled
+# (a previous frame still draining) the ISR can fire in that gap, pull the bytes
+# that were just added, and see its local size exceed the stale trans_data_length.
+# That path logs "I2C TX BUFFER SIZE ERROR" and then neither decrements the counter
+# nor disables the TX interrupt -- so the level-triggered TX-FIFO-watermark interrupt
+# re-asserts forever, storming CPU0 until the interrupt watchdog panics the chip.
+#
+# v2 replaces the pre-queued backlog with an on_request callback: the master's read
+# is what prompts us to hand over a frame, so the racing path is never executed.
+#
+# sdkconfig is generated -- keep this here so a regenerated config can't silently
+# drop the flag and bring the crash back.
+CONFIG_I2C_ENABLE_SLAVE_DRIVER_VERSION_2=y

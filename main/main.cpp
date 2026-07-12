@@ -3,6 +3,7 @@
 #include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 #include "driver/twai.h"
 #include "driver/gpio.h"
 #include "driver/dac_oneshot.h"
@@ -211,11 +212,11 @@ static float energy_wh  = 0.0f;   // cumulative energy counter, Wh (ZombieVerter
 static volatile int opmode = 0;   // ZombieVerter opmode (0=Off … see OPMODE_ID)
 
 // --- Timing ---
+// I2C has no interval: frames are built on demand, when the master's read fires
+// the on_request callback (see the I2C slave section).
 static uint64_t lastSendTime   = 0;
 static uint64_t lastSlowTime   = 0;
-static uint64_t lastI2cTime    = 0;
 #define SEND_INTERVAL_MS   200   // ESP-NOW send rate + RPM poll
-#define I2C_INTERVAL_MS    40    // I2C frame rate (master polls ~50 Hz; keep it fed)
 #define SLOW_INTERVAL_MS   500   // rotating SDO reads (SOC, temps, UDC)
 
 // =============================================================================
@@ -504,19 +505,36 @@ static void checkTwaiHealth(void) {
 // I2C slave — serves telemetry to the waveform display master (waveform_tr_display)
 // SCL = GPIO 22, SDA = GPIO 21, slave address 0x42
 //
-// The master polls at ~50 Hz while we refresh far slower, over the IDF slave's
-// unframed byte-stream ring buffer (RINGBUF_TYPE_BYTEBUF). A bare packet has no
-// boundary the master can lock onto, so an out-of-phase or underrun read returns
-// a torn/shifted window that occasionally passes the range checks -> gauge flicker.
-//
-// Fix: wrap each snapshot in a self-describing frame the master can resync to:
+// Each snapshot is wrapped in a self-describing frame the master can resync to:
 //     [SYNC0][SYNC1][ TelemetryPacket payload ][CRC8 over payload]
-// The master reads a multi-frame window, scans for the sync marker, and accepts
-// the payload only if the CRC checks out — so torn/underrun reads are rejected
-// instead of shown. The frame is larger than the 32-byte HW TX FIFO, so the ISR
-// streams it out across successive FIFO top-ups — which is exactly what the
-// byte-stream ring buffer is for, and why the master must reframe every read.
-// (The original ESP32 has no I2C RAM/snapshot mode, so framing is the fix here.)
+// The frame is larger than the 32-byte HW TX FIFO and the master polls on its own
+// schedule, so a raw read can land mid-packet. The master therefore reads a
+// two-frame window, scans it for the sync marker (newest first) and accepts the
+// payload only if the CRC checks out — torn or underrun reads are rejected rather
+// than displayed. (The original ESP32 has no I2C RAM/snapshot mode, so framing is
+// the fix here.) This wire format is unchanged; the display needs no edits.
+//
+// Data is served ON DEMAND, from the master's read, via the v2 slave driver's
+// on_request callback — NOT pre-queued into the TX ring buffer. That is deliberate,
+// and it is what stops the board crashing:
+//
+//   i2c_slave_transmit() (v1) pushes bytes into the ring buffer BEFORE updating
+//   trans_data_length under the spinlock. If the TX interrupt is already enabled
+//   (a previous frame still draining) the ISR can fire in that gap, pull the bytes
+//   just added, and find its local size exceeds the stale trans_data_length. That
+//   path logs "I2C TX BUFFER SIZE ERROR" and then neither decrements the counter
+//   nor disables the TX interrupt — so the level-triggered TX-FIFO-watermark
+//   interrupt re-asserts forever, storming CPU0 until the interrupt watchdog
+//   panics the chip. Keeping a backlog topped up (as the old design did, writing
+//   every 40 ms into a 4-frame buffer) sits on that window continuously.
+//
+// Serving on request means there is never a pending frame when we write, so the
+// racing path is never executed. It also means the master always gets the NEWEST
+// snapshot instead of one up to four frames stale, and the whole stall-detect /
+// backoff / recreate-the-device apparatus is gone: if the master stops reading,
+// on_request simply stops firing and we go quiet on our own.
+//
+// Requires CONFIG_I2C_ENABLE_SLAVE_DRIVER_VERSION_2=y (see sdkconfig.defaults).
 // =============================================================================
 #define I2C_SCL_PIN    GPIO_NUM_22
 #define I2C_SDA_PIN    GPIO_NUM_21
@@ -528,27 +546,95 @@ static void checkTwaiHealth(void) {
 
 #define I2C_SYNC0      0xAAu
 #define I2C_SYNC1      0x55u
-#define I2C_FRAME_LEN  (2 + (int)sizeof(TelemetryPacket) + 1)   // sync(2)+payload(34)+crc(1)=37
+#define I2C_FRAME_LEN  (2 + (int)sizeof(TelemetryPacket) + 1)   // sync(2)+payload+crc(1)
 
-static i2c_slave_dev_handle_t i2c_slave = NULL;
+// The master reads a two-frame window and scans it newest-first (I2C_READ_LEN in
+// waveform_tr_display/main/i2c_rx.c). Serve exactly that: two copies of the current
+// frame, so whatever byte its read lands on, a whole valid frame follows.
+#define I2C_WINDOW_LEN (I2C_FRAME_LEN * 2)
+
+// The write happens in task context, not in the callback: i2c_slave_write() takes a
+// mutex and can block, so it has no business running in an ISR. The callback only
+// posts the request (this is the pattern in IDF's own i2c_slave_network_sensor
+// example). The master clock-stretches while it waits, which is what buys the task
+// time to respond.
+#define I2C_WRITE_TIMEOUT_MS 50
+
+static i2c_slave_dev_handle_t i2c_slave     = NULL;
+static QueueHandle_t          i2c_req_queue = NULL;
 
 static uint8_t ow_crc8(const uint8_t *data, int len);   // defined with the OneWire helpers
 static void    fillPacket(void);                        // defined with the ESP-NOW helpers
 
-// (Re)create the I2C slave device. The IDF slave driver exposes no way to flush
-// the TX ring buffer, so tearing the device down and rebuilding it is the only
-// way to drop a backlog and re-arm the peripheral after the bus wedges.
+// ISR context — keep it to posting the event and nothing else.
+static IRAM_ATTR bool onI2cRequest(i2c_slave_dev_handle_t /*dev*/,
+                                   const i2c_slave_request_event_data_t * /*evt*/,
+                                   void * /*arg*/) {
+    BaseType_t taskWoken = pdFALSE;
+    uint8_t    evt       = 1;
+    xQueueSendFromISR(i2c_req_queue, &evt, &taskWoken);
+    return taskWoken == pdTRUE;
+}
+
+// Builds a fresh frame per request and hands it over. Blocks on the queue when the
+// master isn't reading, so an absent master costs nothing and logs nothing.
+static void i2c_slave_task(void *) {
+    uint8_t window[I2C_WINDOW_LEN];
+
+    while (true) {
+        uint8_t evt;
+        if (xQueueReceive(i2c_req_queue, &evt, portMAX_DELAY) != pdTRUE) continue;
+
+        fillPacket();   // latest values (opmode-gated UDC, etc.) at the moment of the read
+
+        window[0] = I2C_SYNC0;
+        window[1] = I2C_SYNC1;
+        memcpy(&window[2], &packet, sizeof(packet));
+        window[2 + sizeof(packet)] = ow_crc8((const uint8_t *)&packet, sizeof(packet));
+        memcpy(&window[I2C_FRAME_LEN], window, I2C_FRAME_LEN);   // second copy
+
+        uint32_t total = 0;
+        while (total < sizeof(window)) {
+            uint32_t  written = 0;
+            esp_err_t err     = i2c_slave_write(i2c_slave, window + total,
+                                                sizeof(window) - total, &written,
+                                                I2C_WRITE_TIMEOUT_MS);
+            if (err != ESP_OK || written == 0) {
+                // A timeout here means the master started a read and then stopped
+                // clocking (unplugged mid-transaction, or a noisy bus). Nothing to
+                // recover — the next read starts a fresh frame. Rate-limit so a
+                // disconnected master can't flood the log.
+                static uint64_t lastWarn = 0;
+                if (millis() - lastWarn >= 1000) {
+                    ESP_LOGW(TAG, "I2C write stalled after %lu/%d bytes: %s — master stopped clocking?",
+                             (unsigned long)total, (int)sizeof(window), esp_err_to_name(err));
+                    lastWarn = millis();
+                }
+                break;
+            }
+            total += written;
+        }
+    }
+}
+
 static bool i2cSlaveStart(void) {
+    i2c_req_queue = xQueueCreate(4, sizeof(uint8_t));
+    if (i2c_req_queue == NULL) {
+        ESP_LOGE(TAG, "I2C request queue create failed");
+        return false;
+    }
+
     i2c_slave_config_t cfg = {};
-    cfg.i2c_port       = I2C_NUM_0;
-    cfg.scl_io_num     = I2C_SCL_PIN;
-    cfg.sda_io_num     = I2C_SDA_PIN;
-    cfg.clk_source     = I2C_CLK_SRC_DEFAULT;
-    cfg.slave_addr     = I2C_SLAVE_ADDR;
-    cfg.addr_bit_len   = I2C_ADDR_BIT_LEN_7;
-    // Room for a few frames so a brief master stall doesn't drop data; the master
-    // reframes each read, so backlog is harmless (staleness is bounded, not shown wrong).
-    cfg.send_buf_depth = I2C_FRAME_LEN * 4;
+    cfg.i2c_port          = I2C_NUM_0;
+    cfg.scl_io_num        = I2C_SCL_PIN;
+    cfg.sda_io_num        = I2C_SDA_PIN;
+    cfg.clk_source        = I2C_CLK_SRC_DEFAULT;
+    cfg.slave_addr        = I2C_SLAVE_ADDR;
+    cfg.addr_bit_len      = I2C_ADDR_BIT_LEN_7;
+    // One window in flight at a time — we write only in response to a read, so there
+    // is no backlog to size for.
+    cfg.send_buf_depth    = I2C_WINDOW_LEN;
+    cfg.receive_buf_depth = I2C_WINDOW_LEN;   // unused (master never writes) but required
 
     esp_err_t err = i2c_new_slave_device(&cfg, &i2c_slave);
     if (err != ESP_OK) {
@@ -556,96 +642,27 @@ static bool i2cSlaveStart(void) {
         ESP_LOGE(TAG, "I2C slave init failed: %s", esp_err_to_name(err));
         return false;
     }
+
+    i2c_slave_event_callbacks_t cbs = {};
+    cbs.on_request = onI2cRequest;
+    err = i2c_slave_register_event_callbacks(i2c_slave, &cbs, NULL);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "I2C slave callback register failed: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    // Priority above the main loop so a master read is answered promptly (it is
+    // stretching the clock until we do). CPU 1 keeps it clear of the WiFi stack.
+    xTaskCreatePinnedToCore(i2c_slave_task, "i2c_tx", 4096, NULL, 10, NULL, 1);
     return true;
-}
-
-// Drop the stale device (and with it the wedged FIFO / backed-up ring buffer)
-// and build a fresh one. Losing the queued frames is fine — the master reframes
-// every read and CRC-checks it, so a dropped frame is simply not displayed.
-static void i2cSlaveRecover(void) {
-    ESP_LOGW(TAG, "I2C slave: recreating device to clear the stalled TX buffer");
-    if (i2c_slave != NULL) {
-        i2c_del_slave_device(i2c_slave);
-        i2c_slave = NULL;
-    }
-    if (i2cSlaveStart())
-        ESP_LOGI(TAG, "I2C slave: device recreated OK");
-    // On failure i2c_slave stays NULL; sendI2c() no-ops and we retry next probe.
-}
-
-// The slave TX ring buffer drains ONLY from the TX-FIFO watermark ISR, which
-// fires when the master clocks bytes out. So a full ring buffer does not mean
-// "master is slow" — it means the master is not reading at all (unplugged, or
-// its transactions are failing on a noisy/long bus). Hammering a full buffer at
-// the send rate just makes the IDF driver log "no space in ringbuffer" at that
-// rate. Detect the stall, back off to a slow probe, and resume when it drains.
-#define I2C_FULL_STREAK_LIMIT  3      // consecutive full buffers before backing off
-#define I2C_BACKOFF_MS         1000   // probe rate while the master is not reading
-#define I2C_RECOVER_GAP_MS     5000   // min gap between slave-device recreations
-
-static void sendI2c(void) {
-    static uint64_t retryAfter  = 0;
-    static uint64_t lastRecover = 0;
-    static int      fullStreak  = 0;
-    static bool     stalled     = false;
-
-    if (retryAfter != 0 && millis() < retryAfter) return;   // backing off
-
-    // A previous recovery failed to bring the device back — retry it on this probe.
-    if (i2c_slave == NULL) {
-        i2cSlaveRecover();
-        if (i2c_slave == NULL) {
-            retryAfter = millis() + I2C_BACKOFF_MS;
-            return;
-        }
-    }
-
-    fillPacket();   // refresh payload with the latest values (opmode-gated UDC, etc.)
-
-    uint8_t frame[I2C_FRAME_LEN];
-    frame[0] = I2C_SYNC0;
-    frame[1] = I2C_SYNC1;
-    memcpy(&frame[2], &packet, sizeof(packet));
-    frame[2 + sizeof(packet)] = ow_crc8((const uint8_t *)&packet, sizeof(packet));
-
-    esp_err_t err = i2c_slave_transmit(i2c_slave, frame, sizeof(frame), 0);
-
-    if (err == ESP_OK) {
-        if (stalled)
-            ESP_LOGI(TAG, "I2C master is reading again — resuming normal frame rate");
-        stalled    = false;
-        fullStreak = 0;
-        retryAfter = 0;
-    } else if (err == ESP_ERR_INVALID_STATE) {
-        // Ring buffer full — the master has stopped clocking data out.
-        if (++fullStreak >= I2C_FULL_STREAK_LIMIT) {
-            if (!stalled) {
-                stalled = true;
-                ESP_LOGW(TAG, "I2C master not reading (ring buffer full) — backing off to %d ms probes. "
-                              "Check bus wiring/pull-ups.",
-                         I2C_BACKOFF_MS);
-            }
-            // Recreate the device to clear the backlog and re-arm the peripheral.
-            // Rate-limited: if the master is genuinely gone this would otherwise
-            // thrash, since the fresh buffer refills within a few frames.
-            uint64_t now = millis();
-            if (now - lastRecover >= I2C_RECOVER_GAP_MS) {
-                i2cSlaveRecover();
-                lastRecover = millis();
-                fullStreak  = 0;
-            }
-            retryAfter = millis() + I2C_BACKOFF_MS;
-        }
-    } else {
-        ESP_LOGW(TAG, "I2C slave write failed: %s", esp_err_to_name(err));
-    }
 }
 
 // =============================================================================
 // ESP-NOW
 // =============================================================================
 
-// Populate the I2C telemetry packet from the current values (used by sendI2c).
+// Populate the I2C telemetry packet from the current values. Called from
+// i2c_slave_task at the moment the master reads, so the frame is always current.
 static void fillPacket(void) {
     packet.speed_mph  = speed_mph;
     packet.temp_bat_c = temp_bat_c;
@@ -1168,7 +1185,7 @@ extern "C" void app_main(void) {
     pwm_init();
 
     // --- I2C slave init (SCL GPIO 22, SDA GPIO 21, addr 0x42) ---
-    // Same path sendI2c() uses to recover a wedged bus, so config can't drift.
+    // Also starts i2c_slave_task, which serves a frame whenever the master reads.
     if (i2cSlaveStart())
         ESP_LOGI(TAG, "I2C slave ready (SCL GPIO %d, SDA GPIO %d, addr 0x%02X)",
                  I2C_SCL_PIN, I2C_SDA_PIN, I2C_SLAVE_ADDR);
@@ -1228,12 +1245,7 @@ extern "C" void app_main(void) {
                      speed_mph, soc_pct, temp_bat_c, temp_mot_c, temp_inv_c, temp_isa_c, udc_v, power_kw, energy_wh, opmode);
         }
 
-        // I2C frame — faster cadence than ESP-NOW so the ~50 Hz master polling
-        // finds a fresh, complete frame to lock onto instead of underrun filler.
-        if (now - lastI2cTime >= I2C_INTERVAL_MS) {
-            sendI2c();
-            lastI2cTime = millis();
-        }
+        // (No I2C send here — i2c_slave_task builds a frame when the master reads.)
 
         // Slow params — rotating across 7 slots (the UDC slot also reads opmode)
         if (now - lastSlowTime >= SLOW_INTERVAL_MS) {
