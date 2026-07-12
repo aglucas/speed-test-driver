@@ -316,7 +316,7 @@ static void updatePwmOutputs(void) {
 // CANopen SDO helpers (mirrors CanSDO::requestSdoElement / CanSDO::GetValue)
 // =============================================================================
 
-static void requestSdo(int id) {
+static esp_err_t requestSdo(int id) {
     uint16_t index  = SDO_INDEX_BASE | (uint16_t)(id >> 8);
     uint8_t  subIdx = (uint8_t)(id & 0xFF);
 
@@ -329,24 +329,68 @@ static void requestSdo(int id) {
     msg.data[2] = (uint8_t)(index  >> 8);
     msg.data[3] = subIdx;
     // data[4-7] zero-initialised above
-    twai_transmit(&msg, pdMS_TO_TICKS(10));
+    return twai_transmit(&msg, pdMS_TO_TICKS(10));
 }
 
-static float getSdoValue(int id) {
+// Discard anything already sitting in the RX queue. Called immediately before a
+// request so the receive loop can only ever match a reply to *this* request.
+//
+// Without it, a reply that arrived too late to beat its own deadline stays queued
+// and is picked up by the next call. A stale reply for a *different* param is
+// harmless (the index/subindex check rejects it), but a stale reply for the *same*
+// param passes every check and returns a value one poll-cycle old — a lagging
+// speedo that looks like a working one. Timing out and returning NAN is the honest
+// outcome there, and the callers already handle it.
+static void flushRxQueue(void) {
+    twai_message_t rx;
+    while (twai_receive(&rx, 0) == ESP_OK) { /* drop */ }
+}
+
+// The VCU answers synchronously inside its own CAN receive handler (libopeninv
+// cansdo.cpp: HandleRx -> ProcessSDO -> SendSdoReply), so a healthy reply lands
+// within a millisecond or two. There is no server-side queue or rate limit to
+// wait on, which means a deadline of tens of ms is already enormous headroom —
+// so rather than spend the whole budget on one attempt, make two shorter ones.
+// An occasional dropped frame then self-heals inside a single poll cycle instead
+// of surfacing as a NAN, and the worst-case time per parameter is unchanged.
+#define SDO_ATTEMPT_MS  25
+#define SDO_ATTEMPTS     2
+
+// One request/reply exchange. Returns the value, or NAN on timeout.
+//
+// `sawReply` reports whether any frame arrived during the wait. The acceptance
+// filter admits only 0x583, so anything we receive IS an SDO reply — meaning
+// sawReply=true on a timeout says a reply landed but for a *different* parameter
+// (a late answer to an earlier request), while sawReply=false says the VCU sent
+// nothing at all. `polls` counts how many times we were scheduled to look, which
+// separates "the reply never came" from "we were never running to receive it".
+static float sdoAttempt(int id, bool *sawReply, int *polls) {
     uint16_t index  = SDO_INDEX_BASE | (uint16_t)(id >> 8);
     uint8_t  subIdx = (uint8_t)(id & 0xFF);
 
-    requestSdo(id);
+    *sawReply = false;
+    *polls    = 0;
 
-    // pdMS_TO_TICKS(5) = 0 ticks at CONFIG_FREERTOS_HZ=100 (10 ms/tick), so the
-    // original twai_receive was non-blocking and the loop busy-waited for 50 ms.
-    // Use 10 ms (= 1 tick) so each call blocks and yields when no message is
-    // waiting, and taskYIELD() ensures IDLE0 can reset the watchdog even when
-    // messages arrive continuously.
-    uint64_t deadline = millis() + 50;
+    flushRxQueue();
+
+    // A failed transmit means the request never left the board (TX queue full, or
+    // the controller is bus-off/recovering). Waiting out the deadline for a reply
+    // to a question we never asked would just log it as a "timeout" and hide the
+    // real fault, so bail immediately and name it.
+    esp_err_t txErr = requestSdo(id);
+    if (txErr != ESP_OK) {
+        ESP_LOGW(TAG, "SDO request for param %d not sent: %s", id, esp_err_to_name(txErr));
+        return NAN;
+    }
+
+    // twai_receive blocks (1 tick = 10 ms at CONFIG_FREERTOS_HZ=100) so the loop
+    // yields rather than busy-waits, and taskYIELD() lets IDLE0 pet the watchdog
+    // even when frames arrive back-to-back.
+    uint64_t deadline = millis() + SDO_ATTEMPT_MS;
     while (millis() < deadline) {
         twai_message_t rx = {};
         if (twai_receive(&rx, pdMS_TO_TICKS(10)) == ESP_OK) {
+            *sawReply = true;
             if (rx.identifier       == SDO_REP_ID
                     && rx.data_length_code == 8
                     && rx.data[0]          != SDO_ABORT
@@ -358,10 +402,44 @@ static float getSdoValue(int id) {
                 return (float)(raw / 32.0);
             }
         }
+        (*polls)++;
         taskYIELD();
     }
+    return NAN;
+}
 
-    ESP_LOGW(TAG, "SDO timeout for param %d", id);
+static float getSdoValue(int id) {
+    bool sawReply = false;
+    int  polls    = 0;
+
+    for (int attempt = 1; attempt <= SDO_ATTEMPTS; attempt++) {
+        uint64_t started = millis();
+        float    v       = sdoAttempt(id, &sawReply, &polls);
+        if (!isnan(v)) {
+            if (attempt > 1)
+                ESP_LOGI(TAG, "SDO param %d recovered on attempt %d", id, attempt);
+            return v;
+        }
+        uint64_t elapsed = millis() - started;
+
+        // Overshooting the deadline by a wide margin, having barely been scheduled
+        // to look, means the reply was probably never missed — we simply weren't
+        // running to receive it. On this board the usual culprit is the WiFi stack
+        // preempting the main task on CPU 0 (ESP-NOW sends from this same loop), not
+        // anything on the CAN bus. Called out separately because no amount of CAN-side
+        // tuning fixes a scheduling problem.
+        if (elapsed > SDO_ATTEMPT_MS + 15 && polls <= 2) {
+            ESP_LOGW(TAG, "SDO param %d: task starved (waited %llu ms, polled %d x) — "
+                          "preempted, not a bus fault",
+                     id, (unsigned long long)elapsed, polls);
+        }
+    }
+
+    // "stray reply" = the VCU is answering, but we got an answer to an earlier
+    // request instead of this one (we are running behind it). "silent" = no reply
+    // reached us at all: the VCU never answered, or the reply was dropped/corrupted.
+    ESP_LOGW(TAG, "SDO timeout for param %d after %d attempts (%s)",
+             id, SDO_ATTEMPTS, sawReply ? "stray reply seen — running behind" : "VCU silent");
     return NAN;
 }
 
@@ -404,6 +482,21 @@ static void checkTwaiHealth(void) {
                      (unsigned long)status.bus_error_count);
             lastWarnLog = now;
         }
+    }
+
+    // Frames the driver had to throw away because the RX queue was full
+    // (rx_missed) or the hardware FIFO overran (rx_overrun). With the acceptance
+    // filter admitting only 0x583, these should sit at zero — anything else means
+    // SDO replies are still being dropped before getSdoValue can read them, which
+    // is exactly what the timeouts look like from the outside. Report only when
+    // the count actually moves, so a healthy bus stays silent.
+    static uint32_t lastMissed = 0, lastOverrun = 0;
+    if (status.rx_missed_count != lastMissed || status.rx_overrun_count != lastOverrun) {
+        ESP_LOGW(TAG, "TWAI dropped RX frames: missed=%lu overrun=%lu (SDO replies may be lost)",
+                 (unsigned long)status.rx_missed_count,
+                 (unsigned long)status.rx_overrun_count);
+        lastMissed  = status.rx_missed_count;
+        lastOverrun = status.rx_overrun_count;
     }
 }
 
@@ -991,13 +1084,34 @@ extern "C" void app_main(void) {
     // --- CAN / TWAI init ---
     twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(
         CAN_TX_PIN, CAN_RX_PIN, TWAI_MODE_NORMAL);
-    // The filter is ACCEPT_ALL and the queue is only drained inside getSdoValue()'s
-    // receive loop, which returns as soon as it finds its SDO reply — so unrelated
-    // bus traffic piles up between calls. Deepen the RX queue (default 5) so a burst
-    // of other frames can't evict an SDO reply before we get to read it.
     g_config.rx_queue_len = 32;
     twai_timing_config_t  t_config = TWAI_TIMING_CONFIG_500KBITS();
-    twai_filter_config_t  f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+
+    // Accept ONLY the SDO reply (0x583) in hardware — everything else on the bus is
+    // rejected by the controller and never reaches the RX queue.
+    //
+    // This is what fixes the frequent SDO timeouts. The queue is drained in exactly
+    // one place (getSdoValue's receive loop), which returns the moment it finds its
+    // reply — so for the ~190 ms between polls nothing drains it while the bus keeps
+    // filling it. Under the previous ACCEPT_ALL filter, foreign traffic (inverter,
+    // BMS, VCU broadcasts) overran all 32 slots within that gap, and once the queue
+    // is full the controller drops *new* arrivals — including the 0x583 reply we
+    // were waiting on. The VCU answered promptly; the answer was binned before we
+    // ever looked at it, and we sat out the full 50 ms deadline and called it a
+    // timeout. Filtering in hardware means a foreign frame can never take the slot.
+    //
+    // Nothing else needs receiving: the IVT 0x528 snoop was the only other consumer
+    // of the RX path, and it's gone (energy now comes from the KWh spot value). The
+    // filter does not affect transmission, so the 0x4F1 battery-temp broadcast and
+    // the 0x603 SDO requests are unaffected.
+    //
+    // Single-filter format for 11-bit IDs: the ID sits in the top 11 bits of the
+    // 32-bit acceptance code; a set mask bit means "don't care", so masking off
+    // everything below the ID ignores RTR and the first two data bytes.
+    twai_filter_config_t f_config = {};
+    f_config.acceptance_code = ((uint32_t)SDO_REP_ID) << 21;
+    f_config.acceptance_mask = ~(((uint32_t)0x7FF) << 21);
+    f_config.single_filter   = true;
 
     while (twai_driver_install(&g_config, &t_config, &f_config) != ESP_OK) {
         ESP_LOGE(TAG, "TWAI install failed - retrying in 1s");
