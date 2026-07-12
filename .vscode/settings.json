@@ -10,7 +10,8 @@
     "--query-driver=**",
     "--compile-commands-dir=${workspaceFolder}/build"
   ],
-  "idf.port": "COM3"
+  "idf.port": "COM3",
+  "idf.portWin": "COM4"
 
   // ── Linux (comment out the Windows block above and uncomment below) ───────
   // "idf.currentSetup": "/home/alucas/esp/esp-idf",
